@@ -18,6 +18,7 @@ const server = app.listen(PORT, async () => {
         retries: 3,
         retryDelay: 2000,
       });
+      console.log("ngrok tunnel:", tunnel.url());
 
       const webhookUrl = `${tunnel.url()}/api/stripe/webhook`;
 
