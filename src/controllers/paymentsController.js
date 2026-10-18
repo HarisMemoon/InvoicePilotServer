@@ -51,3 +51,25 @@ export const getPaymentById = async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 };
+
+// Used by the legacy Checkout return URL, which includes an invoice ID only.
+export const getPaymentByInvoiceId = async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("payments")
+      .select("*")
+      .eq("user_id", req.user.id)
+      .eq("invoice_id", req.params.invoiceId)
+      .eq("status", "succeeded")
+      .order("paid_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "No completed payment found" });
+    return res.json({ payment: data });
+  } catch (err) {
+    console.error("getPaymentByInvoiceId error:", err);
+    return res.status(500).json({ error: "Unable to load payment receipt" });
+  }
+};

@@ -1,6 +1,6 @@
 // controllers/stripeController.js
 import Stripe from "stripe";
-import { supabase } from "../utils/supabaseClient.js";
+import { supabaseAdmin } from "../utils/supabaseClient.js";
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2023-10-16",
@@ -16,15 +16,18 @@ export const createCheckoutSession = async (req, res) => {
       return res.status(400).json({ error: "invoice_id is required" });
     }
 
-    const { data: invoice, error } = await supabase
+    // NOTE: `status` is selected on purpose — the already-paid check below
+    // is dead code without it.
+    const { data: invoice, error } = await supabaseAdmin
       .from("invoices")
       .select(
         `
         id,
         invoice_number,
         total_amount,
+        status,
         clients (email, name)
-      `
+      `,
       )
       .eq("id", invoice_id)
       .eq("user_id", userId)
@@ -61,16 +64,20 @@ export const createCheckoutSession = async (req, res) => {
         invoice_id: invoice.id,
         user_id: userId,
       },
+      payment_intent_data: {
+        metadata: { invoice_id: invoice.id, user_id: userId },
+      },
+      client_reference_id: invoice.id,
     });
 
     res.json({ url: session.url });
   } catch (err) {
     console.error("Stripe session error:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Could not start checkout" });
   }
 };
 
-// 2. Webhook
+// 2. Webhook — public route, no auth middleware. Signature is the auth.
 export const stripeWebhook = async (req, res) => {
   let event;
 
@@ -81,14 +88,19 @@ export const stripeWebhook = async (req, res) => {
     event = stripe.webhooks.constructEvent(
       req.body,
       sig,
-      process.env.STRIPE_WEBHOOK_SECRET
+      process.env.STRIPE_WEBHOOK_SECRET,
     );
   } catch (err) {
     console.error("Webhook signature failed:", err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  if (event.type !== "checkout.session.completed") {
+  // Only handle payment-completion events. Ack everything else with 200
+  // so Stripe does not retry them.
+  if (
+    event.type !== "checkout.session.completed" &&
+    event.type !== "checkout.session.async_payment_succeeded"
+  ) {
     return res.json({ received: true });
   }
 
@@ -96,50 +108,80 @@ export const stripeWebhook = async (req, res) => {
   const invoice_id = session.metadata?.invoice_id;
   const user_id = session.metadata?.user_id;
 
+  // Missing metadata can never be fixed by a retry — ack with 200.
   if (!invoice_id || !user_id) {
-    return res.status(400).json({ error: "Invalid metadata" });
+    console.error("Webhook missing metadata", { eventId: event.id });
+    return res.json({ received: true });
   }
 
-  const amount_total = (session.amount_total || 0) / 100;
-  const stripe_payment_id = session.payment_intent;
-  const paid_at = new Date().toISOString();
+  // PaymentIntent ids may arrive as string or nested object.
+  const payment_intent_id =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id;
 
   try {
-    // Update invoice
-    const { error: invErr } = await supabase
-      .from("invoices")
-      .update({ status: "paid" })
-      .eq("id", invoice_id)
-      .eq("user_id", user_id);
-
-    if (invErr) throw invErr;
-
-    // Insert payment
-    const { data: payment, error: payErr } = await supabase
-      .from("payments")
-      .insert({
-        invoice_id,
-        user_id,
-        stripe_payment_id,
-        amount: amount_total,
-        status: "succeeded",
-        paid_at,
-      })
-      .select()
-      .single();
-
-    if (payErr) {
-      console.error("Payment insert failed:", payErr);
-    } else {
-      await supabase
-        .from("invoices")
-        .update({ payment_id: payment.id })
-        .eq("id", invoice_id);
-    }
-
+    await handleCheckoutCompleted({
+      invoice_id,
+      user_id,
+      session,
+      payment_intent_id,
+    });
     res.json({ received: true });
   } catch (err) {
+    // 500 -> Stripe retries the webhook later. Correct for transient DB errors.
     console.error("Webhook processing failed:", err);
     return res.status(500).json({ error: "Processing failed" });
   }
 };
+
+async function handleCheckoutCompleted({
+  invoice_id,
+  user_id,
+  session,
+  payment_intent_id,
+}) {
+  // Idempotency: if this payment was already recorded, do nothing.
+  if (payment_intent_id) {
+    const { data: existing } = await supabaseAdmin
+      .from("payments")
+      .select("id")
+      .eq("stripe_payment_id", payment_intent_id)
+      .maybeSingle();
+    if (existing) return;
+  }
+
+  // Verify the invoice belongs to this user and is not already paid.
+  const { data: invoice, error: invFetchErr } = await supabaseAdmin
+    .from("invoices")
+    .select("id, total_amount, status, user_id")
+    .eq("id", invoice_id)
+    .single();
+
+  if (invFetchErr || !invoice) throw new Error("Invoice not found in webhook");
+  if (invoice.user_id !== user_id) throw new Error("Invoice user mismatch");
+  if (invoice.status === "paid") return; // already handled
+
+  // Never trust the amount from Stripe alone — compare with the DB.
+  const expected = Math.round(Number(invoice.total_amount) * 100);
+  if (session.amount_total !== expected) {
+    throw new Error(
+      `Amount mismatch: stripe=${session.amount_total} db=${expected}`,
+    );
+  }
+  if (session.payment_status !== "paid") {
+    throw new Error(`Payment not completed: ${session.payment_status}`);
+  }
+
+  // Atomic update: invoice -> paid AND payment row inserted together.
+  // Run sql/mark_invoice_paid.sql in the Supabase SQL editor first.
+  const { error: rpcErr } = await supabaseAdmin.rpc("mark_invoice_paid", {
+    p_invoice_id: invoice_id,
+    p_user_id: user_id,
+    p_stripe_payment_id: payment_intent_id || null,
+    p_amount: (session.amount_total || 0) / 100,
+    p_paid_at: new Date().toISOString(),
+  });
+
+  if (rpcErr) throw rpcErr;
+}
