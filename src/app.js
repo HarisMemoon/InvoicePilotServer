@@ -13,20 +13,17 @@ import { stripeWebhook } from "./controllers/stripeController.js";
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ limit: "10mb", extended: true }));
-// CORS
-app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 
-// Stripe webhook (raw body)
+// Stripe requires the unparsed body to validate the webhook signature.
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
   stripeWebhook,
 );
 
-// JSON parser
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 
 // Routes
 app.use("/api/auth", authRoutes);

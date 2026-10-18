@@ -4,7 +4,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "dev": "nodemon index.js",
+    "dev": "node scripts/dev-with-stripe.js",
+    "dev:server": "nodemon index.js",
     "start": "node index.js"
   },
   "keywords": [],
@@ -12,7 +13,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@ngrok/ngrok": "^1.5.2",
     "@supabase/supabase-js": "^2.75.0",
     "bcryptjs": "^3.0.2",
     "cookie-parser": "^1.4.7",

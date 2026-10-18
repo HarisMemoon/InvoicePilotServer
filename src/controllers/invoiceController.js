@@ -159,7 +159,7 @@ export const createInvoice = async (req, res) => {
 };
 
 /* --------------------------------------------------------------
-   GET ALL INVOICES (with client & items)
+   GET INVOICE SUMMARIES
    -------------------------------------------------------------- */
 export const getInvoices = async (req, res) => {
   try {
@@ -178,17 +178,7 @@ export const getInvoices = async (req, res) => {
         created_at,
         clients!invoices_client_id_fkey (
           id,
-          name,
-          email,
-          phone,
-          address
-        ),
-        invoice_items (
-          id,
-          description,
-          quantity,
-          unit_price,
-          total
+          name
         )
       `
       )
